@@ -1,8 +1,12 @@
 import importlib.abc
 import importlib.util
+import math
 import os
+import re
+import xml.etree.ElementTree as ET
 from importlib.machinery import SourceFileLoader
 from io import TextIOWrapper
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -190,6 +194,160 @@ def get_drop_collections(calib: Dict[str, str], cmds: bool) -> List[str]:
 
     prefix = "drop " if cmds else ""
     return [f"{prefix}{c}" for c in drop_calib + drop_add]
+
+
+# Units that appear in the compact file constants, expressed in the units that
+# are used by the reconstruction (mm, tesla, rad, GeV, ns)
+_COMPACT_UNITS = {
+    "mm": 1.0,
+    "cm": 10.0,
+    "m": 1000.0,
+    "um": 1e-3,
+    "micrometer": 1e-3,
+    "nm": 1e-6,
+    "tesla": 1.0,
+    "kilogauss": 0.1,
+    "gauss": 1e-4,
+    "rad": 1.0,
+    "radian": 1.0,
+    "mrad": 1e-3,
+    "deg": math.pi / 180.0,
+    "degree": math.pi / 180.0,
+    "pi": math.pi,
+    "twopi": 2.0 * math.pi,
+    "GeV": 1.0,
+    "MeV": 1e-3,
+    "keV": 1e-6,
+    "eV": 1e-9,
+    "TeV": 1e3,
+    "ns": 1.0,
+    "us": 1e3,
+    "ms": 1e6,
+    "s": 1e9,
+}
+_COMPACT_FUNCTIONS = {
+    name: getattr(math, name)
+    for name in (
+        "sin",
+        "cos",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "atan2",
+        "sqrt",
+        "exp",
+        "log",
+        "log10",
+        "pow",
+        "fabs",
+        "floor",
+        "ceil",
+    )
+}
+_COMPACT_FUNCTIONS.update({"abs": abs, "min": min, "max": max})
+# identifiers (constants, units, functions), but not the exponent of a float literal like 1e-3
+_COMPACT_IDENTIFIER = re.compile(r"(?<![0-9.])[A-Za-z_][A-Za-z0-9_]*")
+
+
+class CompactConstants:
+    """Minimal resolver for the ``<constant>`` definitions of a DD4hep compact file
+
+    This parses the compact file and (recursively) all files that it includes
+    via ``<include ref="..."/>`` and collects the ``<constant name="..."
+    value="..."/>`` definitions as well as the ``<field>`` definitions. The
+    constants can then be evaluated numerically (in mm, tesla, rad, GeV, ns),
+    following the usual DD4hep expression syntax (constants referring to other
+    constants, units, basic arithmetic and math functions).
+
+    This does not build any geometry and is therefore cheap enough to be used
+    at configuration time, e.g. to extract the nominal magnetic field or the
+    calorimeter envelope dimensions for algorithms that need them as
+    properties.
+    """
+
+    def __init__(self, compact_file: Union[str, os.PathLike]) -> None:
+        """Parse the compact file and all its includes
+
+        Args:
+            compact_file (Union[str, os.PathLike]): The compact file to parse
+        """
+        self.constants: Dict[str, str] = {}
+        self.fields: List[Dict[str, str]] = []
+        self._values: Dict[str, float] = {}
+        self._visited = set()
+        self._parse(Path(os.path.expandvars(str(compact_file))))
+
+    def _parse(self, path: Path) -> None:
+        path = path.resolve()
+        if path in self._visited or not path.is_file():
+            return
+        self._visited.add(path)
+        for elem in ET.parse(path).getroot().iter():
+            if elem.tag == "include" and "ref" in elem.attrib:
+                ref = Path(os.path.expandvars(elem.attrib["ref"]))
+                self._parse(ref if ref.is_absolute() else path.parent / ref)
+            elif elem.tag == "constant" and "name" in elem.attrib and "value" in elem.attrib:
+                # The first definition wins (same as the order in which DD4hep processes the file)
+                self.constants.setdefault(elem.attrib["name"], elem.attrib["value"])
+            elif elem.tag == "field":
+                self.fields.append(dict(elem.attrib))
+
+    def evaluate(self, expression: str) -> float:
+        """Evaluate an expression that may use constants, units and math functions
+
+        Args:
+            expression (str): The expression to evaluate, e.g. ``"TPC_outer_radius + 35*mm"``
+
+        Returns:
+            float: The numerical value in mm / tesla / rad / GeV / ns
+        """
+
+        def _replace(match: re.Match) -> str:
+            name = match.group(0)
+            if name in _COMPACT_FUNCTIONS:
+                return name
+            if name in _COMPACT_UNITS:
+                return repr(_COMPACT_UNITS[name])
+            if name in self.constants:
+                return f"({self.get(name)!r})"
+            raise KeyError(f"Unknown constant or unit '{name}' in expression '{expression}'")
+
+        expr = _COMPACT_IDENTIFIER.sub(_replace, expression.replace("^", "**"))
+        return float(eval(expr, {"__builtins__": {}}, _COMPACT_FUNCTIONS))
+
+    def get(self, name: str) -> float:
+        """Get the numerical value of a constant
+
+        Args:
+            name (str): The name of the constant
+
+        Returns:
+            float: The numerical value in mm / tesla / rad / GeV / ns
+        """
+        if name not in self._values:
+            if name not in self.constants:
+                raise KeyError(f"Constant '{name}' is not defined in the compact file")
+            self._values[name] = self.evaluate(self.constants[name])
+        return self._values[name]
+
+    def solenoid_field_tesla(self) -> float:
+        """Get the nominal (central) solenoid field in tesla
+
+        This uses the ``inner_field`` of the first ``<field type="solenoid">``
+        definition. Models that use a field map instead fall back to the
+        ``Field_nominal_value`` or ``SolenoidField`` constants.
+
+        Returns:
+            float: The nominal solenoid field in tesla
+        """
+        for field in self.fields:
+            if field.get("type") == "solenoid" and "inner_field" in field:
+                return self.evaluate(field["inner_field"])
+        for name in ("Field_nominal_value", "SolenoidField"):
+            if name in self.constants:
+                return self.get(name)
+        raise KeyError("Could not determine the solenoid field from the compact file")
 
 
 def _append_commas_expect_last(config_list, list_to_add):

@@ -28,7 +28,7 @@ Currently you can find the following sub-directories for usual processors :
 
 - *Tracking* : The tracking digitization and reconstruction processors
 - *CaloDigi* : The calorimeter digitizer (Ecal, Hcal, Fcal and Muon system) processors
-- *ParticleFlow* : The PandoraPFA processor(s)
+- *ParticleFlow* : The PandoraPFA processor(s) and the optional ML based HitPF algorithm
 - *HighLevelReco* : The high level reconstruction (PID, vertexing, cluster shape, MC truth linker) processors
 - *BeamCalReco* : The BeamCal reconstruction settings
 
@@ -160,6 +160,18 @@ output file with similar contents as the *REC* file described above.
 - `--runOverlay` turns on overlay of background events. Defaults to false.
   **NOTE that you have to configure the necessary overlay files first in
   `BgOverlay/BgOverlay.py`!**
+- `--runHitPF` additionally runs the hit based machine learning particle flow
+  [k4PFHitML](https://github.com/key4hep/k4PFHitML) (see
+  `ParticleFlow/HitPF.py`). Defaults to false. The `HitPF`, `HitPFIDs`,
+  `HitPFClusters` and `HitPFMCTruthLink` collections are added to the EDM4hep
+  output only (not compatible with `--lcioOutput=only` and `--trackingOnly`).
+  The ONNX models are taken from the directory given via `--hitPFModelDir`
+  (defaults to `/eos/project/k/key4hep/www/key4hep/testFiles/k4PFHitML`, the
+  files can also be downloaded from
+  https://key4hep.web.cern.ch/testFiles/k4PFHitML/). **NOTE that the models
+  available there have been trained on CLD, there are no ILD trained models
+  yet.** The magnetic field and the ECAL envelope that the algorithm needs are
+  taken from the compact file of the detector model.
 
 ### 4. View the result in the event display
 

@@ -20,6 +20,7 @@ from k4MarlinWrapper.parseConstants import parseConstants
 # importance than necessary)
 sys.path.append(str(Path(__file__).parent))
 from py_utils import (
+    CompactConstants,
     SequenceLoader,
     get_drop_collections,
     import_from,
@@ -167,6 +168,19 @@ parser.add_argument(
     help="Run the Silicon-TPC-track-merging for ILD@FCC-ee",
     action="store_true",
 )
+parser.add_argument(
+    "--runHitPF",
+    help="Run the hit based machine learning particle flow (k4PFHitML) in addition to "
+    "PandoraPFA. The HitPF collections are only written to the EDM4hep output",
+    action="store_true",
+)
+parser.add_argument(
+    "--hitPFModelDir",
+    help="Directory containing the ONNX models for HitPF (clustering_paper.onnx, "
+    "energy_correction_paper_neutral.onnx, energy_correction_paper_charged_pid.onnx)",
+    type=str,
+    default="/eos/project/k/key4hep/www/key4hep/testFiles/k4PFHitML",
+)
 
 
 def get_compact_file_path(detector_model: str):
@@ -193,6 +207,14 @@ def get_cms_energy_config(
 
 
 reco_args = parser.parse_known_args()[0]
+
+if reco_args.runHitPF:
+    # HitPF needs the calorimeter hits and the truth links from the RecoMCTruthLinker
+    if reco_args.trackingOnly:
+        parser.error("--runHitPF is not supported with --trackingOnly")
+    # HitPF produces EDM4hep collections only, so they would be lost without EDM4hep output
+    if reco_args.lcioOutput == "only":
+        parser.error("--runHitPF is not supported with --lcioOutput=only")
 
 algList = []
 svcList = []
@@ -238,6 +260,19 @@ CONSTANTS.update(det_calib_constants)
 
 parseConstants(CONSTANTS)
 
+hitpf_config = None
+if reco_args.runHitPF:
+    # HitPF needs the magnetic field and the ECAL envelope as properties, take
+    # them from the compact file to be consistent with the rest of the reconstruction
+    compact_constants = CompactConstants(compact_file)
+    hitpf_config = {
+        "model_dir": reco_args.hitPFModelDir,
+        "b_field_tesla": compact_constants.solenoid_field_tesla(),
+        "ecal_barrel_radius": compact_constants.get("Ecal_inner_radius"),
+        "ecal_barrel_sides": int(compact_constants.get("Ecal_symmetry")),
+        "ecal_endcap_zmin": compact_constants.get("Ecal_endcap_zmin"),
+    }
+
 sequenceLoader = SequenceLoader(
     algList,
     global_vars={
@@ -245,6 +280,7 @@ sequenceLoader = SequenceLoader(
         "cms_energy_config": cms_energy_config,
         "using_particle_gun": reco_args.usingParticleGun,
         "track_merging": reco_args.trackMerge,
+        "hitpf_config": hitpf_config,
     },
 )
 
@@ -367,6 +403,12 @@ if reco_args.lcioOutput != "only":
     # get_drop_collections incorrectly splits "type edm4hep::..." into two separate drops
     output_commands.append("drop type edm4hep::RecDqdxCollection")
     output_commands.append("drop type edm4hep::ParticleIDCollection")
+    if reco_args.runHitPF:
+        # the last matching command wins, so this has to come after the drop of all ParticleIDs
+        output_commands.append("keep HitPFIDs")
+        # the merged ECAL hit collections are subsets of the original ones and are not needed
+        output_commands.append("drop HitPFEcalBarrelHits")
+        output_commands.append("drop HitPFEcalEndcapHits")
     io_handler.add_edm4hep_writer(f"{reco_args.outputFileBase}_REC.edm4hep.root", output_commands)
 
 
@@ -411,6 +453,12 @@ if reco_args.lcioOutput in ("on", "only"):
         "LCIOOutputFile": [f"{reco_args.outputFileBase}_DST.slcio"],
         "LCIOWriteMode": ["WRITE_NEW"],
     }
+
+# HitPF is a native Gaudi algorithm working on EDM4hep collections. It runs
+# last, after all Marlin processors (including the LCIO writers), such that its
+# outputs never have to be converted to LCIO
+if reco_args.runHitPF:
+    sequenceLoader.load("ParticleFlow/HitPF")
 
 io_handler.finalize_converters()
 
